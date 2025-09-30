@@ -1,0 +1,151 @@
+# tinygpt_infer.py
+"""
+TinyGPT inference that REUSES code from tinygpt_train.py (no duplication).
+
+Examples:
+  python tinygpt_infer.py --prompt "The history of machine learning"
+  python tinygpt_infer.py --interactive
+  # if you trained with different files:
+  python tinygpt_infer.py --model tiny_gpt.pth --tokenizer tiny_gpt_tokenizer.json
+"""
+
+import argparse
+from pathlib import Path
+import torch
+
+# --- reuse everything from the training script ---
+from train_tiny_gpt import (
+    TinyGPT,
+    SimpleTokenizer,
+    EMBED_DIM as TRAIN_EMBED_DIM,
+    NUM_HEADS as TRAIN_NUM_HEADS,
+    NUM_LAYERS as TRAIN_NUM_LAYERS,
+    SEQ_LEN as TRAIN_SEQ_LEN,
+    DROPOUT as TRAIN_DROPOUT,
+)
+
+
+def pick_device(choice: str):
+    if choice == "cuda" and torch.cuda.is_available():
+        return torch.device("cuda")
+    if choice == "mps" and torch.backends.mps.is_available():
+        return torch.device("mps")
+    if choice == "cpu":
+        return torch.device("cpu")
+    # auto
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def load_model_and_tokenizer(
+    model_path: str,
+    tokenizer_path: str,
+    embed_dim: int,
+    num_heads: int,
+    num_layers: int,
+    seq_len: int,
+    dropout: float,
+    device: torch.device,
+):
+    tok = SimpleTokenizer.load(tokenizer_path)  # uses @classmethod from your train script
+    model = TinyGPT(
+        vocab_size=len(tok.vocab),
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        num_layers=num_layers,
+        seq_len=seq_len,
+        p_drop=dropout,
+    ).to(device)
+    state = torch.load(model_path, map_location=device)
+    model.load_state_dict(state, strict=True)
+    model.eval()
+    return model, tok
+
+
+def generate_once(model, tok, device, prompt, max_new_tokens, temperature, top_k):
+    ids = torch.tensor([tok.encode(prompt)], dtype=torch.long, device=device)
+    out = model.generate(
+        ids,
+        max_new_tokens=max_new_tokens,
+        top_k=top_k,
+        temperature=temperature,
+    )[0].tolist()
+    return tok.decode(out)
+
+
+def repl(model, tok, device, args):
+    print("TinyGPT REPL (Ctrl+C or empty line to exit)")
+    try:
+        while True:
+            prompt = input("\nPrompt> ").strip()
+            if not prompt:
+                break
+            print("\nGenerating...\n")
+            text = generate_once(
+                model, tok, device, prompt,
+                args.max_new_tokens, args.temperature, args.top_k
+            )
+            print(text)
+    except (KeyboardInterrupt, EOFError):
+        print("\nBye!")
+
+
+def main():
+    p = argparse.ArgumentParser(description="TinyGPT inference (imports from tinygpt_train.py)")
+    p.add_argument("--model", default="tiny_gpt.pth", help="Path to .pth weights")
+    p.add_argument("--tokenizer", default="tiny_gpt_tokenizer.json", help="Path to tokenizer json")
+
+    # Defaults mirror your training script constants, but can be overridden
+    p.add_argument("--embed-dim", type=int, default=TRAIN_EMBED_DIM)
+    p.add_argument("--num-heads", type=int, default=TRAIN_NUM_HEADS)
+    p.add_argument("--num-layers", type=int, default=TRAIN_NUM_LAYERS)
+    p.add_argument("--seq-len", type=int, default=TRAIN_SEQ_LEN)
+    p.add_argument("--dropout", type=float, default=TRAIN_DROPOUT)
+
+    p.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")
+    p.add_argument("--prompt", type=str, help="Prompt to complete (omit for --interactive)")
+    p.add_argument("--max-new-tokens", type=int, default=120)
+    p.add_argument("--temperature", type=float, default=0.9)
+    p.add_argument("--top-k", type=int, default=40, help="<=0 disables top-k")
+    p.add_argument("--interactive", action="store_true")
+
+    args = p.parse_args()
+
+    device = pick_device(args.device)
+    print(f"Using device: {device}")
+
+    if not Path(args.model).exists():
+        raise FileNotFoundError(f"Model not found: {args.model}")
+    if not Path(args.tokenizer).exists():
+        raise FileNotFoundError(f"Tokenizer not found: {args.tokenizer}")
+
+    model, tok = load_model_and_tokenizer(
+        model_path=args.model,
+        tokenizer_path=args.tokenizer,
+        embed_dim=args.embed_dim,
+        num_heads=args.num_heads,
+        num_layers=args.num_layers,
+        seq_len=args.seq_len,
+        dropout=args.dropout,
+        device=device,
+    )
+
+    if args.interactive:
+        repl(model, tok, device, args)
+        return
+
+    if not args.prompt:
+        raise SystemExit("Provide --prompt or use --interactive.")
+
+    text = generate_once(
+        model, tok, device, args.prompt,
+        args.max_new_tokens, args.temperature, args.top_k
+    )
+    print(text)
+
+
+if __name__ == "__main__":
+    main()
