@@ -15,17 +15,17 @@ from torch.utils.data import Dataset, DataLoader
 # ----------------------------
 # Config (tweak freely)
 # ----------------------------
-EMBED_DIM   = 128
+EMBED_DIM   = 64
 NUM_HEADS   = 4
 NUM_LAYERS  = 4
-SEQ_LEN     = 128
+SEQ_LEN     = 64
 BATCH_SIZE  = 32
-EPOCHS      = 1
+EPOCHS      = 4
 LR          = 3e-4
 WEIGHT_DECAY = 0.01
 GRAD_CLIP   = 1.0
 DROPOUT     = 0.1
-LIMIT_LINES = 15000  # how many non-empty lines from wikitext-2/train.txt to load
+LIMIT_LINES = None  # how many non-empty lines from wikitext-2/train.txt to load
 DATA_PATH   = "wikitext-2/train.txt"
 MODEL_OUT   = "tiny_gpt.pth"
 TOKENIZER_OUT = "tiny_gpt_tokenizer.json"
