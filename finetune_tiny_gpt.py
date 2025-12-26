@@ -38,6 +38,8 @@ from train_tiny_gpt import (
     TinyGPT,
     SimpleTokenizer,
     TextDataset,
+    get_checkpoint_config,
+    load_checkpoint_for_state_dict,
     EMBED_DIM as TRAIN_EMBED_DIM,
     NUM_HEADS as TRAIN_NUM_HEADS,
     NUM_LAYERS as TRAIN_NUM_LAYERS,
@@ -234,6 +236,26 @@ def main():
     device = pick_device(args.device)
     print(f"Using device: {device}")
 
+    # --- load pretrained checkpoint early so seq_len/model dims match everywhere ---
+    if not Path(args.model).exists():
+        raise FileNotFoundError(f"Pretrained model not found: {args.model}")
+    ckpt = torch.load(args.model, map_location=device)
+    ckpt_cfg = get_checkpoint_config(ckpt)
+    if ckpt_cfg:
+        for k, v in {
+            "embed_dim": args.embed_dim,
+            "num_heads": args.num_heads,
+            "num_layers": args.num_layers,
+            "seq_len": args.seq_len,
+        }.items():
+            if int(ckpt_cfg[k]) != int(v):
+                print(f"[note] overriding --{k.replace('_','-')}={v} with checkpoint {k}={ckpt_cfg[k]}")
+        args.embed_dim = int(ckpt_cfg["embed_dim"])
+        args.num_heads = int(ckpt_cfg["num_heads"])
+        args.num_layers = int(ckpt_cfg["num_layers"])
+        args.seq_len = int(ckpt_cfg["seq_len"])
+        args.dropout = float(ckpt_cfg["dropout"])
+
     # --- load tokenizer (reused; do NOT refit) ---
     tok = SimpleTokenizer.load(args.tokenizer)
     warn_if_oov_tags(tok, args.user_tag, args.assistant_tag)
@@ -272,10 +294,8 @@ def main():
         p_drop=args.dropout,
     ).to(device)
 
-    # load pretrained weights
-    if not Path(args.model).exists():
-        raise FileNotFoundError(f"Pretrained model not found: {args.model}")
-    state = torch.load(args.model, map_location=device)
+    # load pretrained weights (checkpoint dict or raw state_dict)
+    state = load_checkpoint_for_state_dict(ckpt)
     model.load_state_dict(state, strict=True)
 
     # optional freezing

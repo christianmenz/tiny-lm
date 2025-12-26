@@ -17,6 +17,8 @@ import torch
 from train_tiny_gpt import (
     TinyGPT,
     SimpleTokenizer,
+    get_checkpoint_config,
+    load_checkpoint_for_state_dict,
     EMBED_DIM as TRAIN_EMBED_DIM,
     NUM_HEADS as TRAIN_NUM_HEADS,
     NUM_LAYERS as TRAIN_NUM_LAYERS,
@@ -51,6 +53,16 @@ def load_model_and_tokenizer(
     device: torch.device,
 ):
     tok = SimpleTokenizer.load(tokenizer_path)  # uses @classmethod from your train script
+    ckpt = torch.load(model_path, map_location=device)
+    ckpt_cfg = get_checkpoint_config(ckpt)
+    if ckpt_cfg:
+        # Prefer the saved config to avoid silent mismatch.
+        embed_dim = int(ckpt_cfg["embed_dim"])
+        num_heads = int(ckpt_cfg["num_heads"])
+        num_layers = int(ckpt_cfg["num_layers"])
+        seq_len = int(ckpt_cfg["seq_len"])
+        dropout = float(ckpt_cfg["dropout"])
+
     model = TinyGPT(
         vocab_size=len(tok.vocab),
         embed_dim=embed_dim,
@@ -59,7 +71,8 @@ def load_model_and_tokenizer(
         seq_len=seq_len,
         p_drop=dropout,
     ).to(device)
-    state = torch.load(model_path, map_location=device)
+
+    state = load_checkpoint_for_state_dict(ckpt)
     model.load_state_dict(state, strict=True)
     model.eval()
     return model, tok
@@ -93,7 +106,7 @@ def repl(model, tok, device, args):
         print("\nBye!")
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser(description="TinyGPT inference (imports from tinygpt_train.py)")
     p.add_argument("--model", default="tiny_gpt.pth", help="Path to .pth weights")
     p.add_argument("--tokenizer", default="tiny_gpt_tokenizer.json", help="Path to tokenizer json")
@@ -112,7 +125,7 @@ def main():
     p.add_argument("--top-k", type=int, default=40, help="<=0 disables top-k")
     p.add_argument("--interactive", action="store_true")
 
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     device = pick_device(args.device)
     print(f"Using device: {device}")
