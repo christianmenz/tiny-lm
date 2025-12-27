@@ -16,7 +16,7 @@ import torch
 # --- reuse everything from the training script ---
 from train_tiny_gpt import (
     TinyGPT,
-    SimpleTokenizer,
+    load_tokenizer,
     get_checkpoint_config,
     load_checkpoint_for_state_dict,
     EMBED_DIM as TRAIN_EMBED_DIM,
@@ -52,7 +52,7 @@ def load_model_and_tokenizer(
     dropout: float,
     device: torch.device,
 ):
-    tok = SimpleTokenizer.load(tokenizer_path)  # uses @classmethod from your train script
+    tok = load_tokenizer(tokenizer_path)
     ckpt = torch.load(model_path, map_location=device)
     ckpt_cfg = get_checkpoint_config(ckpt)
     if ckpt_cfg:
@@ -78,13 +78,15 @@ def load_model_and_tokenizer(
     return model, tok
 
 
-def generate_once(model, tok, device, prompt, max_new_tokens, temperature, top_k):
+def generate_once(model, tok, device, prompt, max_new_tokens, temperature, top_k, top_p, repetition_penalty):
     ids = torch.tensor([tok.encode(prompt)], dtype=torch.long, device=device)
     out = model.generate(
         ids,
         max_new_tokens=max_new_tokens,
         top_k=top_k,
+        top_p=top_p,
         temperature=temperature,
+        repetition_penalty=repetition_penalty,
     )[0].tolist()
     return tok.decode(out)
 
@@ -99,7 +101,7 @@ def repl(model, tok, device, args):
             print("\nGenerating...\n")
             text = generate_once(
                 model, tok, device, prompt,
-                args.max_new_tokens, args.temperature, args.top_k
+                args.max_new_tokens, args.temperature, args.top_k, args.top_p, args.repetition_penalty
             )
             print(text)
     except (KeyboardInterrupt, EOFError):
@@ -123,6 +125,8 @@ def main(argv=None):
     p.add_argument("--max-new-tokens", type=int, default=120)
     p.add_argument("--temperature", type=float, default=0.9)
     p.add_argument("--top-k", type=int, default=40, help="<=0 disables top-k")
+    p.add_argument("--top-p", type=float, default=0.95, help="(0,1) enables nucleus sampling; else disabled")
+    p.add_argument("--repetition-penalty", type=float, default=1.1, help="1.0 disables")
     p.add_argument("--interactive", action="store_true")
 
     args = p.parse_args(argv)
@@ -155,7 +159,7 @@ def main(argv=None):
 
     text = generate_once(
         model, tok, device, args.prompt,
-        args.max_new_tokens, args.temperature, args.top_k
+        args.max_new_tokens, args.temperature, args.top_k, args.top_p, args.repetition_penalty
     )
     print(text)
 

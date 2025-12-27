@@ -36,7 +36,7 @@ from torch.utils.data import DataLoader
 # --- reuse from your training script (keeps things DRY) ---
 from train_tiny_gpt import (
     TinyGPT,
-    SimpleTokenizer,
+    load_tokenizer,
     TextDataset,
     get_checkpoint_config,
     load_checkpoint_for_state_dict,
@@ -99,7 +99,7 @@ def load_lines(paths, limit=None) -> List[str]:
 
 
 def make_token_stream(
-    tokenizer: SimpleTokenizer,
+    tokenizer,
     lines: List[str],
     user_tag: str = "question",
     assistant_tag: str = "answer",
@@ -144,14 +144,14 @@ def make_token_stream(
             current_role = None
             continue
 
-        s = raw.lower()
+        s_lower = raw.lower()
 
-        if s == UT:
+        if s_lower == UT:
             current_role = "user"
             encode_and_append(UT)  # include the tag token itself
             continue
 
-        if s == AT:
+        if s_lower == AT:
             # finishing any previous role; if it was assistant already, separate
             if current_role == "assistant":
                 tokens.append(eol_id)
@@ -160,7 +160,7 @@ def make_token_stream(
             continue
 
         # content line for whichever role is active
-        encode_and_append(s)
+        encode_and_append(raw)
 
         # If next line starts a new role or we hit end/blank, we'll detect in the next loop
         # and add the extra <eol> after assistant block ends.
@@ -172,7 +172,7 @@ def make_token_stream(
     return tokens, unk_count, total
 
 
-def warn_if_oov_tags(tokenizer: SimpleTokenizer, user_tag: str, assistant_tag: str):
+def warn_if_oov_tags(tokenizer, user_tag: str, assistant_tag: str):
     unk_id = tokenizer.vocab[tokenizer.unk_token]
     ut_ids = tokenizer.encode(user_tag.lower())
     at_ids = tokenizer.encode(assistant_tag.lower())
@@ -257,7 +257,7 @@ def main():
         args.dropout = float(ckpt_cfg["dropout"])
 
     # --- load tokenizer (reused; do NOT refit) ---
-    tok = SimpleTokenizer.load(args.tokenizer)
+    tok = load_tokenizer(args.tokenizer)
     warn_if_oov_tags(tok, args.user_tag, args.assistant_tag)
 
     # --- data ---
@@ -362,7 +362,18 @@ def main():
     print(f"Fine-tuning complete in {dur_min:.2f} minutes")
 
     # --- save ---
-    torch.save(model.state_dict(), args.output)
+    ckpt_out = {
+        "model_state_dict": model.state_dict(),
+        "config": {
+            "embed_dim": args.embed_dim,
+            "num_heads": args.num_heads,
+            "num_layers": args.num_layers,
+            "seq_len": args.seq_len,
+            "dropout": args.dropout,
+            "vocab_size": len(tok.vocab),
+        },
+    }
+    torch.save(ckpt_out, args.output)
     print(f"Saved finetuned weights -> {args.output}")
     print("Note: reuse the SAME tokenizer JSON you trained with.")
     print("Prompt pattern at inference:")

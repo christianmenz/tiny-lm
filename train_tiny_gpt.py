@@ -12,26 +12,31 @@ import math
 import json
 import time
 import random
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
+try:
+    import numpy as np
+except Exception:  # pragma: no cover
+    np = None
+
 
 # ----------------------------
 # Config (tweak freely)
 # ----------------------------
-EMBED_DIM   = 64
+EMBED_DIM   = 128
 NUM_HEADS   = 4
-NUM_LAYERS  = 4
-SEQ_LEN     = 64
+NUM_LAYERS  = 6
+SEQ_LEN     = 128
 BATCH_SIZE  = 32
-EPOCHS      = 4
-LR          = 3e-4
+EPOCHS      = 1
+LR          = 5e-4
 WEIGHT_DECAY = 0.01
 GRAD_CLIP   = 1.0
 DROPOUT     = 0.1
@@ -65,7 +70,8 @@ def pick_device(choice: str) -> torch.device:
 
 def set_seed(seed: int):
     random.seed(seed)
-    np.random.seed(seed)
+    if np is not None:
+        np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -80,7 +86,7 @@ def _try_set_matmul_precision():
 
 
 # ----------------------------
-# Simple tokenizer (word-level)
+# Tokenizers
 # ----------------------------
 class SimpleTokenizer:
     def __init__(
@@ -137,6 +143,7 @@ class SimpleTokenizer:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(
                 {
+                    "type": "word",
                     "lower": self.lower,
                     "unk_token": self.unk_token,
                     "eol_token": self.eol_token,
@@ -152,32 +159,175 @@ class SimpleTokenizer:
     def load(cls, path):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        tok = cls.from_dict(data)
+        return tok
+
+    @classmethod
+    def from_dict(cls, data: dict):
         tok = cls(
-            lower=data["lower"],
-            unk_token=data["unk_token"],
-            eol_token=data["eol_token"],
+            lower=bool(data.get("lower", True)),
+            unk_token=str(data.get("unk_token", "<unk>")),
+            eol_token=str(data.get("eol_token", "<eol>")),
             max_vocab=data.get("max_vocab", None),
             min_freq=int(data.get("min_freq", 1)),
         )
-        tok.vocab = data["vocab"]
+        vocab = data.get("vocab", None) or {}
+        tok.vocab = {str(k): int(v) for k, v in vocab.items()}
         tok.inv_vocab = {v: k for k, v in tok.vocab.items()}
         return tok
+
+
+class ByteTokenizer:
+    """
+    Byte-level tokenizer with reserved special tokens.
+
+    This removes OOV issues and preserves punctuation/spacing exactly.
+    """
+
+    TYPE = "byte"
+
+    def __init__(
+        self,
+        lower: bool = False,
+        unk_token: str = "<unk>",
+        eol_token: str = "<eol>",
+    ):
+        self.lower = lower
+        self.unk_token = unk_token
+        self.eol_token = eol_token
+
+        self.vocab: Dict[str, int] = {
+            self.unk_token: 0,
+            self.eol_token: 1,
+        }
+        for b in range(256):
+            self.vocab[self._byte_token(b)] = 2 + b
+
+        self._unk_id = self.vocab[self.unk_token]
+        self._eol_id = self.vocab[self.eol_token]
+        self._special_re = re.compile(f"({re.escape(self.unk_token)}|{re.escape(self.eol_token)})")
+
+    def _normalize(self, text: str) -> str:
+        return text.lower() if self.lower else text
+
+    @staticmethod
+    def _byte_token(b: int) -> str:
+        return f"<0x{b:02x}>"
+
+    def fit(self, lines: List[str]):
+        # no-op (deterministic vocab)
+        return
+
+    def encode(self, text: str) -> List[int]:
+        text = self._normalize(text)
+        ids: List[int] = []
+        parts = self._special_re.split(text)
+        for part in parts:
+            if not part:
+                continue
+            if part == self.unk_token:
+                ids.append(self._unk_id)
+                continue
+            if part == self.eol_token:
+                ids.append(self._eol_id)
+                continue
+            bs = part.encode("utf-8", errors="replace")
+            ids.extend([2 + b for b in bs])
+        return ids
+
+    def decode(self, ids: List[int]) -> str:
+        out: List[str] = []
+        buf = bytearray()
+        for i in ids:
+            if i == self._eol_id:
+                if buf:
+                    out.append(buf.decode("utf-8", errors="replace"))
+                    buf.clear()
+                out.append("\n")
+                continue
+            if i == self._unk_id:
+                if buf:
+                    out.append(buf.decode("utf-8", errors="replace"))
+                    buf.clear()
+                out.append(self.unk_token)
+                continue
+            b = i - 2
+            if 0 <= b <= 255:
+                buf.append(b)
+            else:
+                if buf:
+                    out.append(buf.decode("utf-8", errors="replace"))
+                    buf.clear()
+                out.append(self.unk_token)
+        if buf:
+            out.append(buf.decode("utf-8", errors="replace"))
+        return "".join(out)
+
+    def save(self, path: str):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "type": self.TYPE,
+                    "lower": self.lower,
+                    "unk_token": self.unk_token,
+                    "eol_token": self.eol_token,
+                },
+                f,
+                ensure_ascii=False,
+            )
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ByteTokenizer":
+        return cls(
+            lower=bool(data.get("lower", False)),
+            unk_token=str(data.get("unk_token", "<unk>")),
+            eol_token=str(data.get("eol_token", "<eol>")),
+        )
+
+    @classmethod
+    def load(cls, path: str) -> "ByteTokenizer":
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return cls.from_dict(data)
+
+
+def load_tokenizer(path: str):
+    """
+    Backward-compatible tokenizer loader.
+
+    - Old files (no `type`) are treated as `SimpleTokenizer`.
+    - New files include `type` ("word" or "byte").
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    tok_type = str(data.get("type", "word")).lower()
+    if tok_type == "byte":
+        return ByteTokenizer.from_dict(data)
+
+    # default: word-level
+    return SimpleTokenizer.from_dict(data)
 
 
 # ----------------------------
 # Dataset
 # ----------------------------
 class TextDataset(Dataset):
-    def __init__(self, token_ids, seq_len):
+    def __init__(self, token_ids, seq_len, stride: int = 1):
         self.token_ids = token_ids
         self.seq_len = seq_len
+        self.stride = max(int(stride), 1)
 
     def __len__(self):
-        return max(0, len(self.token_ids) - self.seq_len)
+        n = len(self.token_ids) - self.seq_len  # matches the old (stride=1) behavior
+        if n <= 0:
+            return 0
+        return ((n - 1) // self.stride) + 1
 
     def __getitem__(self, idx):
-        x = self.token_ids[idx : idx + self.seq_len]
-        y = self.token_ids[idx + 1 : idx + self.seq_len + 1]
+        start = idx * self.stride
+        x = self.token_ids[start : start + self.seq_len]
+        y = self.token_ids[start + 1 : start + self.seq_len + 1]
         return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
 
@@ -227,17 +377,43 @@ class TinyGPT(nn.Module):
         return logits
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens=64, top_k=50, temperature=1.0):
+    def generate(
+        self,
+        idx,
+        max_new_tokens: int = 64,
+        top_k: Optional[int] = 50,
+        top_p: Optional[float] = None,
+        temperature: float = 1.0,
+        repetition_penalty: float = 1.0,
+    ):
         self.eval()
         for _ in range(max_new_tokens):
             x_cond = idx[:, -self.seq_len :]
             logits = self.forward(x_cond)[:, -1, :]
             logits = logits / max(temperature, 1e-6)
+
+            if repetition_penalty and repetition_penalty != 1.0:
+                # Penalize tokens already present in the context window.
+                for b in range(idx.size(0)):
+                    prev = idx[b, -self.seq_len :].unique()
+                    logits[b, prev] /= repetition_penalty
+
             if top_k is not None and top_k > 0:
                 k = min(top_k, logits.size(-1))
                 top_vals, _ = torch.topk(logits, k=k)
                 thresh = top_vals[:, -1].unsqueeze(-1)
                 logits[logits < thresh] = -float("inf")
+
+            if top_p is not None and 0.0 < top_p < 1.0:
+                sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+                sorted_probs = torch.softmax(sorted_logits, dim=-1)
+                cumprobs = torch.cumsum(sorted_probs, dim=-1)
+                mask = cumprobs > top_p
+                mask[..., 0] = False  # always keep at least one token
+                sorted_logits[mask] = -float("inf")
+                logits = torch.full_like(logits, -float("inf"))
+                logits.scatter_(dim=-1, index=sorted_idx, src=sorted_logits)
+
             probs = torch.softmax(logits, dim=-1)
             next_id = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, next_id], dim=1)
@@ -279,7 +455,7 @@ def load_text_lines(path: Path, limit_lines: Optional[int] = None) -> List[str]:
     return lines
 
 
-def build_token_stream(tokenizer: SimpleTokenizer, lines: List[str]) -> List[int]:
+def build_token_stream(tokenizer, lines: List[str]) -> List[int]:
     eol_id = tokenizer.vocab[tokenizer.eol_token]
     all_tokens: List[int] = []
     for line in lines:
@@ -309,6 +485,7 @@ def main(argv: Optional[List[str]] = None):
     ap.add_argument("--test-file", default=TEST_PATH, help="Optional test file to report final perplexity")
     ap.add_argument("--limit-lines", type=int, default=LIMIT_LINES)
 
+    ap.add_argument("--tokenizer-type", choices=["byte", "word"], default="byte")
     ap.add_argument("--embed-dim", type=int, default=EMBED_DIM)
     ap.add_argument("--num-heads", type=int, default=NUM_HEADS)
     ap.add_argument("--num-layers", type=int, default=NUM_LAYERS)
@@ -322,6 +499,7 @@ def main(argv: Optional[List[str]] = None):
     ap.add_argument("--grad-clip", type=float, default=GRAD_CLIP)
     ap.add_argument("--warmup-ratio", type=float, default=WARMUP_RATIO)
     ap.add_argument("--log-interval", type=int, default=LOG_INTERVAL)
+    ap.add_argument("--stride", type=int, default=0, help="Token stride between sequences (0 => use seq-len)")
 
     ap.add_argument("--max-vocab", type=int, default=MAX_VOCAB)
     ap.add_argument("--min-freq", type=int, default=MIN_FREQ)
@@ -349,8 +527,11 @@ def main(argv: Optional[List[str]] = None):
         raise SystemExit("No training lines found.")
 
     # ---------- Tokenize ----------
-    tokenizer = SimpleTokenizer(max_vocab=args.max_vocab, min_freq=args.min_freq)
-    tokenizer.fit(train_lines)
+    if args.tokenizer_type == "word":
+        tokenizer = SimpleTokenizer(max_vocab=args.max_vocab, min_freq=args.min_freq)
+        tokenizer.fit(train_lines)
+    else:
+        tokenizer = ByteTokenizer()
     train_tokens = build_token_stream(tokenizer, train_lines)
     print(f"Train tokens: {len(train_tokens)} | Vocab size: {len(tokenizer.vocab)}")
 
@@ -366,15 +547,16 @@ def main(argv: Optional[List[str]] = None):
     if len(train_tokens) <= seq_len + 1:
         raise ValueError("Not enough tokens for the chosen --seq-len.")
 
+    stride = args.seq_len if (args.stride is None or int(args.stride) <= 0) else int(args.stride)
     if val_tokens is None:
         # fallback: last 5% of the token stream as a quick sanity check
         split_idx = int(0.95 * (len(train_tokens) - seq_len))
-        train_ds = TextDataset(train_tokens[:split_idx], seq_len)
-        val_ds = TextDataset(train_tokens[split_idx:], seq_len)
+        train_ds = TextDataset(train_tokens[:split_idx], seq_len, stride=stride)
+        val_ds = TextDataset(train_tokens[split_idx:], seq_len, stride=stride)
         print("[note] validation.txt missing; using a small holdout from train stream.")
     else:
-        train_ds = TextDataset(train_tokens, seq_len)
-        val_ds = TextDataset(val_tokens, seq_len)
+        train_ds = TextDataset(train_tokens, seq_len, stride=stride)
+        val_ds = TextDataset(val_tokens, seq_len, stride=stride)
 
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
     val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, drop_last=False)
@@ -450,7 +632,14 @@ def main(argv: Optional[List[str]] = None):
         with torch.no_grad():
             seed = tokenizer.encode(prompt)[-args.seq_len :]
             prompt_ids = torch.tensor([seed], dtype=torch.long, device=device)
-            out = model.generate(prompt_ids, max_new_tokens=80, top_k=40, temperature=0.9)[0].tolist()
+            out = model.generate(
+                prompt_ids,
+                max_new_tokens=80,
+                top_k=40,
+                top_p=0.95,
+                temperature=0.9,
+                repetition_penalty=1.1,
+            )[0].tolist()
         print("=== SAMPLE ===")
         print(tokenizer.decode(out))
         print("==============")
@@ -465,6 +654,7 @@ def main(argv: Optional[List[str]] = None):
                 "seq_len": args.seq_len,
                 "dropout": args.dropout,
                 "vocab_size": len(tokenizer.vocab),
+                "tokenizer_type": args.tokenizer_type,
             },
         }
         is_best = val_loss < best_val
@@ -483,7 +673,11 @@ def main(argv: Optional[List[str]] = None):
     if test_path and test_path.exists():
         test_lines = load_text_lines(test_path, limit_lines=None)
         test_tokens = build_token_stream(tokenizer, test_lines)
-        test_dl = DataLoader(TextDataset(test_tokens, args.seq_len), batch_size=args.batch_size, shuffle=False)
+        test_dl = DataLoader(
+            TextDataset(test_tokens, args.seq_len, stride=stride),
+            batch_size=args.batch_size,
+            shuffle=False,
+        )
         test_loss, test_ppl = evaluate(model, test_dl, criterion, device)
         print(f"Test | loss {test_loss:.4f} | ppl {test_ppl:.2f} (from {test_path})")
 
