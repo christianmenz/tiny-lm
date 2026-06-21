@@ -309,6 +309,25 @@ def load_tokenizer(path: str):
     return SimpleTokenizer.from_dict(data)
 
 
+def default_suppress_ids(tokenizer, allow_nonprintable_bytes: bool = False) -> List[int]:
+    """
+    Keep early byte-level generations readable.
+
+    A weak byte model can sample arbitrary UTF-8 continuation/control bytes, which
+    decode as replacement characters. For English smoke tests, suppress those by
+    default while still allowing normal printable ASCII and line breaks.
+    """
+    if allow_nonprintable_bytes or not isinstance(tokenizer, ByteTokenizer):
+        ids: List[int] = []
+        unk = getattr(tokenizer, "unk_token", None)
+        vocab = getattr(tokenizer, "vocab", {})
+        if unk is not None and unk in vocab:
+            ids.append(int(vocab[unk]))
+        return ids
+    allowed = {9, 10, 13, *range(32, 127)}
+    return [2 + b for b in range(256) if b not in allowed]
+
+
 # ----------------------------
 # Dataset
 # ----------------------------
@@ -361,8 +380,19 @@ class TinyGPT(nn.Module):
         m = m.masked_fill(m == 1, float("-inf")).masked_fill(m == 0, 0.0)
         self.register_buffer("causal_mask", m, persistent=False)
 
+        self.apply(self._init_weights)
+
         # weight tying
         self.fc.weight = self.token_emb.weight
+
+    @staticmethod
+    def _init_weights(module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, x):
         B, T = x.shape
@@ -385,12 +415,22 @@ class TinyGPT(nn.Module):
         top_p: Optional[float] = None,
         temperature: float = 1.0,
         repetition_penalty: float = 1.0,
+        greedy: bool = False,
+        suppress_ids: Optional[List[int]] = None,
     ):
         self.eval()
+        suppress_tensor = None
+        if suppress_ids:
+            suppress_tensor = torch.tensor(suppress_ids, dtype=torch.long, device=idx.device)
         for _ in range(max_new_tokens):
             x_cond = idx[:, -self.seq_len :]
             logits = self.forward(x_cond)[:, -1, :]
             logits = logits / max(temperature, 1e-6)
+
+            if suppress_tensor is not None:
+                valid = suppress_tensor[suppress_tensor < logits.size(-1)]
+                if valid.numel() > 0:
+                    logits[:, valid] = -float("inf")
 
             if repetition_penalty and repetition_penalty != 1.0:
                 # Penalize tokens already present in the context window.
@@ -414,8 +454,11 @@ class TinyGPT(nn.Module):
                 logits = torch.full_like(logits, -float("inf"))
                 logits.scatter_(dim=-1, index=sorted_idx, src=sorted_logits)
 
-            probs = torch.softmax(logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)
+            if greedy:
+                next_id = torch.argmax(logits, dim=-1, keepdim=True)
+            else:
+                probs = torch.softmax(logits, dim=-1)
+                next_id = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, next_id], dim=1)
         return idx
 
@@ -455,6 +498,17 @@ def load_text_lines(path: Path, limit_lines: Optional[int] = None) -> List[str]:
     return lines
 
 
+def load_text_lines_many(paths: List[str], limit_lines: Optional[int] = None) -> List[str]:
+    lines: List[str] = []
+    for path in paths:
+        p = Path(path)
+        extra = load_text_lines(p, limit_lines=None)
+        lines.extend(extra)
+        if limit_lines is not None and len(lines) >= limit_lines:
+            return lines[:limit_lines]
+    return lines
+
+
 def build_token_stream(tokenizer, lines: List[str]) -> List[int]:
     eol_id = tokenizer.vocab[tokenizer.eol_token]
     all_tokens: List[int] = []
@@ -484,8 +538,16 @@ def main(argv: Optional[List[str]] = None):
     ap.add_argument("--val-file", default=VAL_PATH, help="Validation file (optional; falls back to split if missing)")
     ap.add_argument("--test-file", default=TEST_PATH, help="Optional test file to report final perplexity")
     ap.add_argument("--limit-lines", type=int, default=LIMIT_LINES)
+    ap.add_argument("--limit-val-lines", type=int, default=None)
+    ap.add_argument("--limit-test-lines", type=int, default=None)
 
     ap.add_argument("--tokenizer-type", choices=["byte", "word"], default="byte")
+    ap.add_argument(
+        "--tokenizer-extra-file",
+        action="append",
+        default=[],
+        help="Additional text file(s) used only to build the tokenizer vocabulary.",
+    )
     ap.add_argument("--embed-dim", type=int, default=EMBED_DIM)
     ap.add_argument("--num-heads", type=int, default=NUM_HEADS)
     ap.add_argument("--num-layers", type=int, default=NUM_LAYERS)
@@ -529,7 +591,10 @@ def main(argv: Optional[List[str]] = None):
     # ---------- Tokenize ----------
     if args.tokenizer_type == "word":
         tokenizer = SimpleTokenizer(max_vocab=args.max_vocab, min_freq=args.min_freq)
-        tokenizer.fit(train_lines)
+        tokenizer_lines = list(train_lines)
+        if args.tokenizer_extra_file:
+            tokenizer_lines.extend(load_text_lines_many(args.tokenizer_extra_file))
+        tokenizer.fit(tokenizer_lines)
     else:
         tokenizer = ByteTokenizer()
     train_tokens = build_token_stream(tokenizer, train_lines)
@@ -538,7 +603,7 @@ def main(argv: Optional[List[str]] = None):
     # ---------- Validation tokens ----------
     val_tokens: Optional[List[int]] = None
     if val_path and val_path.exists():
-        val_lines = load_text_lines(val_path, limit_lines=None)
+        val_lines = load_text_lines(val_path, limit_lines=args.limit_val_lines)
         val_tokens = build_token_stream(tokenizer, val_lines)
         print(f"Val tokens: {len(val_tokens)} (from {val_path})")
 
@@ -558,7 +623,12 @@ def main(argv: Optional[List[str]] = None):
         train_ds = TextDataset(train_tokens, seq_len, stride=stride)
         val_ds = TextDataset(val_tokens, seq_len, stride=stride)
 
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
+    if len(train_ds) == 0:
+        raise ValueError("Training dataset is empty; use more data or a smaller --seq-len.")
+    if len(val_ds) == 0:
+        raise ValueError("Validation dataset is empty; use more validation data or a smaller --seq-len.")
+
+    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False)
     val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, drop_last=False)
 
     # ---------- Model ----------
@@ -639,6 +709,7 @@ def main(argv: Optional[List[str]] = None):
                 top_p=0.95,
                 temperature=0.9,
                 repetition_penalty=1.1,
+                suppress_ids=default_suppress_ids(tokenizer),
             )[0].tolist()
         print("=== SAMPLE ===")
         print(tokenizer.decode(out))
@@ -671,7 +742,7 @@ def main(argv: Optional[List[str]] = None):
 
     # ---------- Optional test perplexity ----------
     if test_path and test_path.exists():
-        test_lines = load_text_lines(test_path, limit_lines=None)
+        test_lines = load_text_lines(test_path, limit_lines=args.limit_test_lines)
         test_tokens = build_token_stream(tokenizer, test_lines)
         test_dl = DataLoader(
             TextDataset(test_tokens, args.seq_len, stride=stride),

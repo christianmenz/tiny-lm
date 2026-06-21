@@ -16,6 +16,7 @@ import torch
 # --- reuse everything from the training script ---
 from train_tiny_gpt import (
     TinyGPT,
+    default_suppress_ids,
     load_tokenizer,
     get_checkpoint_config,
     load_checkpoint_for_state_dict,
@@ -78,8 +79,22 @@ def load_model_and_tokenizer(
     return model, tok
 
 
-def generate_once(model, tok, device, prompt, max_new_tokens, temperature, top_k, top_p, repetition_penalty):
+def generate_once(
+    model,
+    tok,
+    device,
+    prompt,
+    max_new_tokens,
+    temperature,
+    top_k,
+    top_p,
+    repetition_penalty,
+    greedy,
+    allow_nonprintable_bytes,
+):
     ids = torch.tensor([tok.encode(prompt)], dtype=torch.long, device=device)
+    if ids.size(1) == 0:
+        raise ValueError("Prompt encoded to zero tokens; provide a non-empty prompt known to the tokenizer.")
     out = model.generate(
         ids,
         max_new_tokens=max_new_tokens,
@@ -87,6 +102,8 @@ def generate_once(model, tok, device, prompt, max_new_tokens, temperature, top_k
         top_p=top_p,
         temperature=temperature,
         repetition_penalty=repetition_penalty,
+        greedy=greedy,
+        suppress_ids=default_suppress_ids(tok, allow_nonprintable_bytes=allow_nonprintable_bytes),
     )[0].tolist()
     return tok.decode(out)
 
@@ -101,7 +118,13 @@ def repl(model, tok, device, args):
             print("\nGenerating...\n")
             text = generate_once(
                 model, tok, device, prompt,
-                args.max_new_tokens, args.temperature, args.top_k, args.top_p, args.repetition_penalty
+                args.max_new_tokens,
+                args.temperature,
+                args.top_k,
+                args.top_p,
+                args.repetition_penalty,
+                args.greedy,
+                args.allow_nonprintable_bytes,
             )
             print(text)
     except (KeyboardInterrupt, EOFError):
@@ -127,6 +150,12 @@ def main(argv=None):
     p.add_argument("--top-k", type=int, default=40, help="<=0 disables top-k")
     p.add_argument("--top-p", type=float, default=0.95, help="(0,1) enables nucleus sampling; else disabled")
     p.add_argument("--repetition-penalty", type=float, default=1.1, help="1.0 disables")
+    p.add_argument("--greedy", action="store_true", help="Greedy decoding (argmax), disables sampling randomness")
+    p.add_argument(
+        "--allow-nonprintable-bytes",
+        action="store_true",
+        help="For byte tokenizers, allow arbitrary byte values in generated text.",
+    )
     p.add_argument("--interactive", action="store_true")
 
     args = p.parse_args(argv)
@@ -159,7 +188,13 @@ def main(argv=None):
 
     text = generate_once(
         model, tok, device, args.prompt,
-        args.max_new_tokens, args.temperature, args.top_k, args.top_p, args.repetition_penalty
+        args.max_new_tokens,
+        args.temperature,
+        args.top_k,
+        args.top_p,
+        args.repetition_penalty,
+        args.greedy,
+        args.allow_nonprintable_bytes,
     )
     print(text)
 

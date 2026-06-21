@@ -11,6 +11,7 @@ import torch
 
 from train_tiny_gpt import (
     TinyGPT,
+    default_suppress_ids,
     load_tokenizer,
     get_checkpoint_config,
     load_checkpoint_for_state_dict,
@@ -105,8 +106,22 @@ def load_model_and_tokenizer(
     return model, tok
 
 
-def generate_once(model, tok, device, prompt, max_new_tokens, temperature, top_k, top_p, repetition_penalty):
+def generate_once(
+    model,
+    tok,
+    device,
+    prompt,
+    max_new_tokens,
+    temperature,
+    top_k,
+    top_p,
+    repetition_penalty,
+    greedy,
+    allow_nonprintable_bytes,
+):
     ids = torch.tensor([tok.encode(prompt)], dtype=torch.long, device=device)
+    if ids.size(1) == 0:
+        raise ValueError("Prompt encoded to zero tokens; provide a non-empty prompt known to the tokenizer.")
     out = model.generate(
         ids,
         max_new_tokens=max_new_tokens,
@@ -114,13 +129,17 @@ def generate_once(model, tok, device, prompt, max_new_tokens, temperature, top_k
         top_p=top_p,
         temperature=temperature,
         repetition_penalty=repetition_penalty,
+        greedy=greedy,
+        suppress_ids=default_suppress_ids(tok, allow_nonprintable_bytes=allow_nonprintable_bytes),
     )[0].tolist()
     return tok.decode(out)
 
-def build_chat_prompt(question: str, user_tag: str, assistant_tag: str, eol_token: str) -> str:
+def build_chat_prompt(tokenizer, question: str, user_tag: str, assistant_tag: str) -> str:
     # Training expects a role-tagged pattern with <eol> tokens.
     q = question.strip()
-    return f"{user_tag} {eol_token} {q} {eol_token} {assistant_tag} {eol_token}"
+    if getattr(tokenizer, "TYPE", "word") == "byte":
+        return f"{user_tag}{tokenizer.eol_token}{q}{tokenizer.eol_token}{assistant_tag}{tokenizer.eol_token}"
+    return f"{user_tag} {tokenizer.eol_token} {q} {tokenizer.eol_token} {assistant_tag} {tokenizer.eol_token}"
 
 
 def extract_answer(decoded_text: str, assistant_tag: str, user_tag: str) -> str:
@@ -172,6 +191,12 @@ def main(argv=None):
     p.add_argument("--top-k", type=int, default=40)
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--repetition-penalty", type=float, default=1.1)
+    p.add_argument("--greedy", action="store_true", help="Greedy decoding (argmax), disables sampling randomness")
+    p.add_argument(
+        "--allow-nonprintable-bytes",
+        action="store_true",
+        help="For byte tokenizers, allow arbitrary byte values in generated text.",
+    )
     p.add_argument("--interactive", action="store_true")
     args = p.parse_args(argv)
 
@@ -197,7 +222,7 @@ def main(argv=None):
     if args.interactive:
         print("TinyGPT fine-tuned REPL (Ctrl+C or empty line to exit)")
         if args.chat:
-            print(f"[chat] using pattern: {args.user_tag} <eol> ... <eol> {args.assistant_tag} <eol>")
+            print(f"[chat] using pattern: {args.user_tag}<eol>...<eol>{args.assistant_tag}<eol>")
         try:
             while True:
                 prompt = input("\nPrompt> ").strip()
@@ -205,7 +230,7 @@ def main(argv=None):
                     break
                 print("\nGenerating...\n")
                 full_prompt = (
-                    build_chat_prompt(prompt, args.user_tag, args.assistant_tag, tok.eol_token)
+                    build_chat_prompt(tok, prompt, args.user_tag, args.assistant_tag)
                     if args.chat
                     else prompt
                 )
@@ -219,6 +244,8 @@ def main(argv=None):
                     args.top_k,
                     args.top_p,
                     args.repetition_penalty,
+                    args.greedy,
+                    args.allow_nonprintable_bytes,
                 )
                 if args.chat and args.answer_only:
                     print(extract_answer(decoded, args.assistant_tag, args.user_tag))
@@ -232,7 +259,7 @@ def main(argv=None):
         raise SystemExit("Provide --prompt or use --interactive.")
 
     full_prompt = (
-        build_chat_prompt(args.prompt, args.user_tag, args.assistant_tag, tok.eol_token)
+        build_chat_prompt(tok, args.prompt, args.user_tag, args.assistant_tag)
         if args.chat
         else args.prompt
     )
@@ -246,6 +273,8 @@ def main(argv=None):
         args.top_k,
         args.top_p,
         args.repetition_penalty,
+        args.greedy,
+        args.allow_nonprintable_bytes,
     )
     if args.chat and args.answer_only:
         print(extract_answer(decoded, args.assistant_tag, args.user_tag))

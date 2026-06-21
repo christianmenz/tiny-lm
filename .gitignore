@@ -4,4 +4,5 @@ tiny_gpt.pth
 openassist/
 
 finetuned_tiny_gpt.pth
+smoke_finetuned_tiny_gpt.pth
 tiny_gpt_tokenizer.json
